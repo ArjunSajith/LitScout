@@ -59,6 +59,22 @@ try:
 except ImportError as e:
     print(f"Using mock Screening agent: {e}")
 
+try:
+    from agents.extraction_agent import extraction_agent as real_extraction
+    extraction_agent = real_extraction
+    print("Real Extraction agent loaded")
+except ImportError as e:
+    print(f"Using mock Extraction agent: {e}")
+
+# Import adaptive extraction module
+try:
+    from agents.adaptive_extraction import adaptive_extraction_loop
+    print("Adaptive extraction module loaded")
+    USE_ADAPTIVE_EXTRACTION = True
+except ImportError as e:
+    print(f"Adaptive extraction not available: {e}")
+    USE_ADAPTIVE_EXTRACTION = False
+
 # --- 1. STATE DEFINITION ---
 class LitScoutState(BaseModel):
     """Complete state management for LitScout"""
@@ -188,6 +204,8 @@ def search_and_filter_tool(research_questions: List[str], inclusion_criteria: st
         # Extract metadata using LLM
         extraction_prompt = f"""Extract filtering criteria from this research query:
 
+Current Year: {current_year}
+
 "{user_prompt}"
 
 Respond with ONLY a JSON object:
@@ -197,7 +215,8 @@ Respond with ONLY a JSON object:
   "sources": [<list of venues or empty array>]
 }}
 
-If no specific years mentioned, use null for both (defaults to last 5 years).
+If no specific years mentioned, use null for both (defaults to last 5 years from current year).
+Consider the current year when interpreting relative time references like "recent", "last decade", etc.
 """
         
         try:
@@ -288,21 +307,59 @@ def screening_tool(filtered_papers: List[Dict], research_questions: List[str],
         }
 
 @tool
-def extraction_tool(screened_papers: List[Dict], research_questions: List[str]) -> Dict[str, Any]:
-    """Extraction Agent Tool"""
+def extraction_tool(screened_papers: List[Dict], research_questions: List[str] = None) -> Dict[str, Any]:
+    """Extraction Agent Tool - Fetches PDFs and extracts text using PyMuPDF with adaptive limiting"""
     print("---TOOL: Extraction Agent---")
     try:
-        extraction_input = {
-            "screened_papers": screened_papers,
-            "research_questions": research_questions,
-            "extraction_template": "standard_literature_review"
-        }
-        print(f"Extracting from {len(screened_papers)} papers")
-        extraction_result = extraction_agent.invoke(extraction_input)
-        print(f"Extraction completed")
-        return extraction_result
+        # Use adaptive extraction if available
+        if USE_ADAPTIVE_EXTRACTION:
+            print("\n🤖 Using ADAPTIVE EXTRACTION with LLM-driven limit adjustment")
+            
+            # Use research questions from parameter or fallback
+            if not research_questions:
+                research_questions = ["Literature review on the given topic"]
+            
+            # Run adaptive extraction loop
+            extracted_papers, metadata = adaptive_extraction_loop(
+                screened_papers=screened_papers,
+                research_questions=research_questions,
+                extraction_agent=extraction_agent
+            )
+            
+            print(f"\n✅ Adaptive extraction completed:")
+            print(f"   Total iterations: {len(metadata['iterations'])}")
+            print(f"   Papers extracted: {metadata['total_extracted']}")
+            print(f"   Success rate: {metadata['total_extracted']/metadata['total_attempted']:.1%}")
+            
+            return {
+                "extracted_data": {"papers": extracted_papers},
+                "extraction_results": metadata
+            }
+        else:
+            # Fallback to original extraction (all papers)
+            print("\n⚠️ Adaptive extraction not available, extracting all papers")
+            extraction_input = {
+                "screened_papers": screened_papers,
+                "papers_with_pdfs": [],
+                "papers_with_text": [],
+                "extraction_results": {}
+            }
+            print(f"Extracting from {len(screened_papers)} papers")
+            extraction_result = extraction_agent.invoke(extraction_input)
+            
+            # Get results from new format
+            papers_extracted = len(extraction_result.get('papers_with_text', []))
+            print(f"Extraction completed: {papers_extracted} papers extracted")
+            
+            # Convert to format expected by orchestrator
+            return {
+                "extracted_data": {"papers": extraction_result.get('papers_with_text', [])},
+                "extraction_results": extraction_result.get('extraction_results', {})
+            }
     except Exception as e:
         print(f"Error in extraction_tool: {e}")
+        import traceback
+        traceback.print_exc()
         return {"extracted_data": {}, "extraction_results": {}, "error": str(e)}
 
 @tool
